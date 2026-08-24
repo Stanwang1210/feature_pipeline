@@ -1,4 +1,6 @@
 import os
+import json
+import datetime
 from pathlib import Path
 import time
 import pyarrow as pa
@@ -7,6 +9,53 @@ from logger import logger
 import torch
 
 from pathlib import Path
+
+def log_failed_file(root_dir, video_path, error):
+    """
+    Append a record of a failed/corrupted file to a persistent JSONL log so
+    users can see exactly which files failed (and why) without having to
+    diff folders or scroll through the full pipeline log.
+    """
+    fail_log_path = os.path.join(root_dir, "failed_files.jsonl")
+    entry = {
+        "video_path": video_path,
+        "error": str(error),
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        with open(fail_log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        logger.error(f"Failed to write to failure log {fail_log_path} for {video_path}")
+
+
+def discard_video_outputs(root_dir, video_path, writers, buffers):
+    """
+    Close and delete any partially-written output files for `video_path` and
+    drop its buffered-but-unwritten frames. Used when a video fails partway
+    through extraction so the leftover file isn't mistaken for a complete,
+    successful extraction on a later run.
+    """
+    for (vid, feat), (sink, writer) in list(writers.items()):
+        if vid != video_path:
+            continue
+        try:
+            writer.close()
+        except Exception:
+            pass
+        try:
+            sink.close()
+        except Exception:
+            pass
+        try:
+            out_path = getFilePath(vid, root_dir, feat)
+            if out_path.exists():
+                out_path.unlink()
+        except Exception:
+            pass
+        del writers[(vid, feat)]
+        buffers.pop((vid, feat), None)
+        logger.warning(f"🗑️ Discarded incomplete output for {vid}/{feat}")
 
 def getFilePath(video_path, root_dir, feature_type):
     """
@@ -159,17 +208,33 @@ def ArrowWriterProcess(root_dir, data_queue, stop_event, batch_size=10):
                     del writers[(vid, feat)]
                     logger.info(f"✅ Closed writer for {vpath}/{feat}")
 
-    # Cleanup on crash/interrupt
+        elif item["type"] == "video_failed":
+            vpath = item["video_path"]
+            error = item.get("error", "unknown error")
+            logger.error(f"❌ {vpath} failed extraction: {error}")
+            discard_video_outputs(root_dir, vpath, writers, buffers)
+            log_failed_file(root_dir, vpath, error)
+
+    # Cleanup on crash/interrupt: any writer still open here belongs to a
+    # video that was still being processed when the queue was torn down
+    # (e.g. Ctrl+C). Force-flushing it would silently produce a truncated
+    # file that looks identical to a successful one, which is exactly what
+    # made it impossible to tell finished videos from failed ones before.
+    # Discard it instead and log it as failed so it gets retried on resume.
     for (vid, feat), (sink, writer) in list(writers.items()):
         try:
-            if buffers.get((vid, feat)):
-                table = pa.table({feat: pa.concat_arrays(buffers[(vid, feat)])})
-                writer.write_table(table)
-                logger.warning(
-                    f"⚠️ Force-flushed {len(buffers[(vid, feat)])} frames for {vid}/{feat}"
-                )
             writer.close()
-            sink.close()
-            logger.warning(f"⚠️ Force-closed unfinished writer for {vid}/{feat}")
         except Exception:
             pass
+        try:
+            sink.close()
+        except Exception:
+            pass
+        try:
+            out_path = getFilePath(vid, root_dir, feat)
+            if out_path.exists():
+                out_path.unlink()
+        except Exception:
+            pass
+        logger.warning(f"⚠️ Discarded incomplete output for {vid}/{feat} (interrupted before completion)")
+        log_failed_file(root_dir, vid, "Interrupted before completion (pipeline shutdown)")

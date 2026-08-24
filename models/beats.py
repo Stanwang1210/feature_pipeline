@@ -9,6 +9,7 @@ import torchaudio.compliance.kaldi as ta_kaldi
 from logger import logger
 
 from models.base import BaseModel
+from utils import convert_to_wav
 
 class BEATsExtractor(BaseModel):
     def __init__(self, model_name: str="BEATs" , 
@@ -67,10 +68,13 @@ class BEATsExtractor(BaseModel):
                 audio = np.mean(audio, axis=1)
             logger.info(f"Loaded audio {audio_path} with shape {audio.shape} and original SR {sr}.")
         elif audio_path.endswith(".mp4"):
-            audio_path_wav = audio_path.replace(".mp4", ".wav")
-            os.system(f"ffmpeg -i {audio_path} -ac 1 -ar 16000 {audio_path_wav}")
-            audio, sr = sf.read(audio_path_wav)
-            os.system(f"rm {audio_path_wav}")
+            tmp_wav = convert_to_wav(audio_path, sampling_rate=16000)
+            try:
+                audio, sr = sf.read(tmp_wav)
+            finally:
+                os.remove(tmp_wav)
+        else:
+            raise ValueError(f"Unsupported audio file extension for {audio_path}")
         audio = audio.astype("float32")
 
         if sr != self.sampling_rate:

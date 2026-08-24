@@ -2,16 +2,49 @@ from typing import Optional, Optional, List, Tuple
 import ffmpeg
 import os
 import requests
+import subprocess
+import tempfile
 import numpy as np
 from PIL import Image
 from io import BytesIO
 import time
 
-import soundfile as sf 
+import soundfile as sf
 import librosa
 from lhotse import Recording, CutSet
 
 MAX_FRAMES = 768
+
+def convert_to_wav(input_path: str, sampling_rate: int = 16000) -> str:
+    """
+    Extract mono PCM audio from a video/audio file into a temporary .wav file
+    using ffmpeg, and return the temp file's path.
+
+    Runs ffmpeg via subprocess with an argument list (no shell) so paths
+    containing spaces, parentheses, or other shell-special characters are
+    passed through unmodified instead of being (mis)parsed by /bin/sh.
+    Raises RuntimeError if ffmpeg fails or produces no output, so callers
+    can treat the source file as unreadable/corrupted.
+    """
+    fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-ac", "1", "-ar", str(sampling_rate),
+        tmp_wav,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if result.returncode != 0 or not os.path.isfile(tmp_wav) or os.path.getsize(tmp_wav) == 0:
+        if os.path.isfile(tmp_wav):
+            os.remove(tmp_wav)
+        stderr_tail = result.stderr.decode(errors="replace")[-800:]
+        raise RuntimeError(
+            f"ffmpeg failed to convert '{input_path}' to wav "
+            f"(exit code {result.returncode}): {stderr_tail}"
+        )
+    return tmp_wav
 
 def list_all_videos(input_paths, exts=(".mp4", ".avi", ".mov", ".mkv")):
     """

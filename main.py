@@ -8,6 +8,16 @@ from logger import logger
 from utils import list_all_videos
 from worker import gpu_worker_thread
 from file_writer_arrow import ArrowWriterProcess   # 👈 new writer process
+from verify import filter_incomplete_videos
+
+def get_buffer_root(conf, phase):
+    return os.path.join(conf.get("buffer_root", "/mnt/14t_drive"), phase["model"]["base_dir"])
+
+def count_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path) as f:
+        return sum(1 for _ in f)
 
 def launch_workers_for_phase(conf, phase, video_paths):
     """
@@ -25,7 +35,7 @@ def launch_workers_for_phase(conf, phase, video_paths):
     stop_event = mp.Event()
 
     # Start the writer process
-    buffer_root = os.path.join(conf.get("buffer_root", "/mnt/14t_drive"), phase["model"]["base_dir"])
+    buffer_root = get_buffer_root(conf, phase)
     os.makedirs(buffer_root, exist_ok=True)
     writer_proc = mp.Process(
         target=ArrowWriterProcess,
@@ -79,6 +89,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Feature extraction pipeline")
     parser.add_argument("--config_path", type=str, default="config/first_batch_pyarrow.yaml",
                         help="Path to the configuration file")
+    parser.add_argument("--force", action="store_true",
+                        help="Reprocess every video even if a valid output already exists "
+                             "(by default, already-completed videos are skipped so the "
+                             "pipeline can resume where it left off).")
     args = parser.parse_args()
 
     conf = read_config(args.config_path)
@@ -100,8 +114,30 @@ if __name__ == "__main__":
 
     try:
         for phase in conf["phases"]:
-            logger.info(f"Starting phase: {phase.get('name', '<unnamed>')}")
-            task_queue, gpu_threads, writer_proc, data_queue, stop_event = launch_workers_for_phase(conf, phase, video_paths)
+            phase_name = phase.get("name", "<unnamed>")
+            logger.info(f"Starting phase: {phase_name}")
+
+            buffer_root = get_buffer_root(conf, phase)
+            feature_types = phase["model"]["features"]
+            fail_log_path = os.path.join(buffer_root, "failed_files.jsonl")
+
+            if args.force:
+                phase_video_paths = video_paths
+                logger.info(f"--force set: reprocessing all {len(phase_video_paths)} videos for phase '{phase_name}'.")
+            else:
+                already_done, phase_video_paths = filter_incomplete_videos(video_paths, buffer_root, feature_types)
+                logger.info(
+                    f"Resume check for phase '{phase_name}': {len(already_done)} already completed "
+                    f"and verified, {len(phase_video_paths)} remaining to process."
+                )
+
+            if not phase_video_paths:
+                logger.success(f"✅ Phase '{phase_name}' already fully complete. Skipping.")
+                continue
+
+            failed_before = count_lines(fail_log_path)
+
+            task_queue, gpu_threads, writer_proc, data_queue, stop_event = launch_workers_for_phase(conf, phase, phase_video_paths)
 
             # Wait for GPU workers to finish
             for t in gpu_threads:
@@ -109,6 +145,25 @@ if __name__ == "__main__":
 
             # Shut everything down
             shutdown_workers(task_queue, gpu_threads, writer_proc, data_queue, stop_event, reason="phase complete")
+
+            # Double-check every file was actually (fully) extracted, rather
+            # than trusting that "no exception" means "done".
+            done_now, still_incomplete = filter_incomplete_videos(phase_video_paths, buffer_root, feature_types)
+            failed_after = count_lines(fail_log_path)
+            new_failures = failed_after - failed_before
+
+            logger.info(
+                f"Verification for phase '{phase_name}': {len(done_now)}/{len(phase_video_paths)} "
+                f"verified complete."
+            )
+            if still_incomplete:
+                logger.warning(
+                    f"⚠️ {len(still_incomplete)} file(s) still incomplete/failed after phase '{phase_name}' "
+                    f"({new_failures} new failure(s) this run). See {fail_log_path} for details, "
+                    f"or re-run the pipeline (without --force) to retry only these files."
+                )
+            else:
+                logger.success(f"✅ Phase '{phase_name}' complete: all files verified.")
 
         logger.success("✅ All tasks completed.")
 

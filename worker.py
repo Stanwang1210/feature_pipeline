@@ -1,3 +1,4 @@
+import os
 import queue
 import sys
 import time
@@ -31,6 +32,11 @@ def gpu_worker_thread(gpu_id, gpu_thread_id, task_queue, data_queue, model_conf,
         logger.info(f"[GPU-{gpu_id}-Thread-{gpu_thread_id}] Start processing {video_path}...")
 
         try:
+            if not os.path.isfile(video_path):
+                raise FileNotFoundError(f"File not found or not readable: {video_path}")
+            if os.path.getsize(video_path) == 0:
+                raise ValueError(f"File is empty (0 bytes), likely corrupted: {video_path}")
+
             # Iterate over extracted features (frame embeddings)
             for feature_name, feature_value in extractor.extract_features(video_path):
                 feature_value["type"] = feature_name
@@ -51,6 +57,13 @@ def gpu_worker_thread(gpu_id, gpu_thread_id, task_queue, data_queue, model_conf,
         except Exception as e:
             logger.error(f"[GPU-{gpu_id}-Thread-{gpu_thread_id}] Error processing {video_path}: {e}")
             traceback.print_exc(file=sys.stderr)
+            # Tell the writer to discard any partial output for this video and
+            # record it as a failed/corrupted file so it can be retried later.
+            data_queue.put({
+                "type": "video_failed",
+                "video_path": video_path,
+                "error": f"{type(e).__name__}: {e}",
+            })
         finally:
             logger.info(f"[GPU-{gpu_id}-Thread-{gpu_thread_id}] Finished {video_path}")
 
