@@ -6,6 +6,7 @@ import os
 
 from logger import logger
 from models.base import BaseModel
+from utils import convert_to_wav
 
 # Reference: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L260
 def speechlib_mel(sample_rate, n_fft, n_mels, fmin=None, fmax=None):
@@ -125,10 +126,13 @@ class Phi4MelExtractor(BaseModel):
             if audio.ndim > 1:
                 audio = np.mean(audio, axis=1)
         elif audio_path.endswith(".mp4"):
-            audio_path_wav = audio_path.replace(".mp4", ".wav")
-            os.system(f"ffmpeg -i {audio_path} -ac 1 -ar 16000 {audio_path_wav}")
-            audio, sr = sf.read(audio_path_wav)
-            os.system(f"rm {audio_path_wav}")
+            tmp_wav = convert_to_wav(audio_path, sampling_rate=16000)
+            try:
+                audio, sr = sf.read(tmp_wav)
+            finally:
+                os.remove(tmp_wav)
+        else:
+            raise ValueError(f"Unsupported audio file extension for {audio_path}")
         audio = audio.astype("float32")
 
         if sr != 16000:
